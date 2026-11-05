@@ -1,0 +1,589 @@
+#!/usr/bin/env bash
+# appimg: install AppImages so they show up in the application menu.
+# Per-user only, no root needed. Depends on bash, coreutils and awk.
+set -euo pipefail
+
+readonly VERSION=0.1.0
+readonly APP_DIR=${APPIMG_DIR:-$HOME/Applications}
+readonly DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
+readonly DESKTOP_DIR=$DATA_HOME/applications
+readonly ICON_DIR=$DATA_HOME/appimg/icons
+readonly BIN_DIR=${APPIMG_BIN_DIR:-$HOME/.local/bin}
+readonly CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
+# Marks desktop entries we created, so list/remove never touch anything else.
+readonly MARK=X-AppImg-Path
+readonly MIME_TYPES=(application/vnd.appimage application/x-iso9660-appimage)
+
+NOTIFY=0
+WORK=""
+PARTIAL=""
+
+usage() {
+	cat <<EOF
+appimg $VERSION: install AppImages into your application menu
+
+Usage:
+  appimg install [--move] FILE.AppImage...   install or update (also: appimg FILE...)
+  appimg list                                show installed AppImages
+  appimg remove NAME...                      uninstall (NAME from 'appimg list')
+  appimg setup [--remove]                    install appimg itself, add "Install
+                                             AppImage" to the file manager's
+                                             right-click menu, and make
+                                             double-clicking an AppImage install it
+
+Options:
+  -m, --move     move the file instead of copying it
+  -n, --notify   report results as desktop notifications (used by the file manager)
+
+AppImages go to $APP_DIR, launchers to $DESKTOP_DIR,
+commands to $BIN_DIR.
+EOF
+}
+
+warn() { printf 'appimg: warning: %s\n' "$*" >&2; }
+
+notify() { # title body [urgency]
+	if command -v notify-send >/dev/null; then
+		notify-send -a appimg -u "${3:-normal}" -i system-software-install "$1" "$2" || true
+	elif command -v kdialog >/dev/null; then
+		kdialog --title "$1" --passivepopup "$2" 8 || true
+	elif command -v zenity >/dev/null; then
+		zenity --notification --text="$1: $2" || true
+	fi
+}
+
+die() {
+	printf 'appimg: %s\n' "$*" >&2
+	if [[ $NOTIFY == 1 ]]; then notify "AppImage not installed" "$*" critical; fi
+	exit 1
+}
+
+cleanup() {
+	if [[ -n $WORK ]]; then rm -rf -- "$WORK"; fi
+	if [[ -n $PARTIAL ]]; then rm -f -- "$PARTIAL"; fi
+}
+trap cleanup EXIT
+
+# --- AppImage inspection ----------------------------------------------------
+
+appimage_type() { # prints 1 or 2; fails if FILE is not an AppImage
+	local magic
+	magic=$(od -An -tx1 -j8 -N3 -- "$1" 2>/dev/null | tr -d ' \n')
+	case $magic in
+	414901) echo 1 ;;
+	414902) echo 2 ;;
+	*) return 1 ;;
+	esac
+}
+
+check_arch() {
+	local file=$1 have want
+	have=$(od -An -tx1 -j18 -N2 -- "$file" | tr -d ' \n')
+	case $have in
+	3e00) have=x86_64 ;;
+	b700) have=aarch64 ;;
+	0300) have=i686 ;;
+	2800) have=armhf ;;
+	*) return 0 ;;
+	esac
+	want=$(uname -m)
+	case $want in
+	i?86) want=i686 ;;
+	armv7*) want=armhf ;;
+	arm64) want=aarch64 ;;
+	esac
+	[[ $have == "$want" ]] || die "$(basename -- "$file") is built for $have, but this machine is $(uname -m)"
+}
+
+# The older type 2 runtime dlopen()s libfuse.so.2; the newer static runtime
+# doesn't. Checking the runtime's strings tells them apart without running it.
+needs_libfuse2() {
+	LC_ALL=C grep -qa 'libfuse\.so\.2' < <(head -c 262144 -- "$1")
+}
+
+have_libfuse2() {
+	local cache
+	cache=$(PATH=$PATH:/sbin:/usr/sbin ldconfig -p 2>/dev/null) || true
+	[[ $cache == *libfuse.so.2* ]]
+}
+
+fuse_hint() {
+	local ids=""
+	if [[ -r /etc/os-release ]]; then
+		ids=$(. /etc/os-release && echo "${ID:-} ${ID_LIKE:-}")
+	fi
+	case " $ids " in
+	*" arch "*) echo "sudo pacman -S fuse2" ;;
+	*" ubuntu "* | *" debian "*) echo "sudo apt install libfuse2t64   (libfuse2 on Ubuntu 22.04 / Debian 12 and older)" ;;
+	*" fedora "* | *" rhel "* | *" centos "*) echo "sudo dnf install fuse-libs" ;;
+	*" suse "* | *" opensuse "*) echo "sudo zypper install libfuse2" ;;
+	*) echo "install your distro's FUSE 2 package (it provides libfuse.so.2)" ;;
+	esac
+}
+
+# Extract paths matching a glob into $WORK/squashfs-root. This uses the
+# AppImage's own runtime, which doesn't need FUSE for extraction.
+extract() {
+	local t=()
+	if command -v timeout >/dev/null; then t=(timeout 120); fi
+	(cd "$WORK" && "${t[@]}" "$IMG" --appimage-extract "$1") >/dev/null 2>&1 || true
+}
+
+# Follow symlinks inside the extracted tree (e.g. .DirIcon -> app.png),
+# extracting each target. Prints the final path relative to the tree root.
+resolve() {
+	local p=$1 t i
+	for i in 1 2 3 4 5 6 7 8; do
+		[[ -L $ROOT/$p ]] || break
+		t=$(readlink -- "$ROOT/$p")
+		[[ $t == /* ]] || t=$(dirname -- "$p")/$t
+		p=$(realpath -m -s -- "/$t")
+		p=${p#/}
+		extract "$p"
+	done
+	if [[ -f $ROOT/$p && ! -L $ROOT/$p ]]; then printf '%s\n' "$p"; fi
+}
+
+desktop_key() { # FILE KEY: print KEY's value from the [Desktop Entry] group
+	awk -v k="$2" '
+		/^\[/ { g = ($0 == "[Desktop Entry]"); next }
+		g && index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }
+	' "$1"
+}
+
+icon_ext() {
+	local head
+	head=$(head -c 256 -- "$1" | tr -d '\0')
+	case $head in
+	$'\x89PNG'*) echo png ;;
+	*'<svg'* | '<?xml'*) echo svg ;;
+	*) echo png ;;
+	esac
+}
+
+# Pick the best icon from the extracted tree. Prints a path relative to it.
+find_icon() {
+	local name=$1 f best="" size max=0
+	name=${name##*/}
+	name=${name%.png}
+	name=${name%.svg}
+	name=${name%.xpm}
+
+	if [[ -n $name ]]; then
+		extract "usr/share/icons/hicolor/*/apps/$name.*"
+		extract "$name.*"
+		for f in "usr/share/icons/hicolor/scalable/apps/$name.svg" "$name.svg"; do
+			if best=$(resolve "$f") && [[ -n $best ]]; then echo "$best"; return; fi
+		done
+		for f in "$ROOT"/usr/share/icons/hicolor/*x*/apps/"$name".png; do
+			[[ -e $f || -L $f ]] || continue
+			size=${f#"$ROOT"/usr/share/icons/hicolor/}
+			size=${size%%x*}
+			[[ $size =~ ^[0-9]+$ ]] || continue
+			if ((size > max)) && f=$(resolve "${f#"$ROOT"/}") && [[ -n $f ]]; then
+				max=$size
+				best=$f
+			fi
+		done
+		if [[ -n $best ]]; then echo "$best"; return; fi
+		if best=$(resolve "$name.png") && [[ -n $best ]]; then echo "$best"; return; fi
+	fi
+	extract .DirIcon
+	resolve .DirIcon
+}
+
+# Copy a desktop entry, pointing Exec= at the installed AppImage and Icon= at
+# the installed icon, and tagging it so we can find it again.
+rewrite_desktop() { # SRC EXE ICON
+	awk -v exe="$2" -v icon="$3" -v mark="$MARK" '
+		/^\[/ {
+			group = $0; print
+			if (group == "[Desktop Entry]") print mark "=" exe
+			next
+		}
+		/^(TryExec|X-AppImg-Path)[ \t]*=/ { next }
+		/^Exec[ \t]*=/ {
+			v = $0; sub(/^Exec[ \t]*=[ \t]*/, "", v)
+			if (v ~ /^"/ && match(v, /^"([^"\\]|\\.)*"/)) rest = substr(v, RLENGTH + 1)
+			else { i = index(v, " "); rest = i ? substr(v, i) : "" }
+			print "Exec=\"" exe "\"" rest
+			next
+		}
+		group == "[Desktop Entry]" && icon != "" && /^Icon[ \t]*=/ { print "Icon=" icon; next }
+		{ print }
+	' "$1"
+}
+
+# Guess a name from a filename like "FreeShow-1.5.9-x86_64.AppImage".
+name_from_file() {
+	local n=${1##*/}
+	n=$(sed -E 's/\.appimage$//I; s/[-_. ]?(x86[-_]64|amd64|aarch64|arm64|i[3-6]86|armhf)//I; s/[-_ ]v?[0-9]+(\.[0-9]+)+.*$//' <<<"$n")
+	echo "${n:-app}"
+}
+
+is_ours() { [[ -f $1 ]] && grep -q "^$MARK=" -- "$1"; }
+
+# --- commands -----------------------------------------------------------------
+
+install_one() {
+	local src=$1 move=$2 type id name desk icon_rel icon="" dest entry bin verb=Installed f
+
+	[[ -f $src ]] || die "no such file: $src"
+	src=$(realpath -- "$src")
+	type=$(appimage_type "$src") || die "not an AppImage: $src"
+	check_arch "$src"
+
+	mkdir -p -- "$APP_DIR" "$DESKTOP_DIR" "$ICON_DIR"
+	case $APP_DIR in *[\"\`\$\\]*) die "APPIMG_DIR must not contain \" \` \$ or \\: $APP_DIR" ;; esac
+
+	# Stage next to the final location so the last step is an atomic rename;
+	# that keeps a running copy of the app working during an update.
+	PARTIAL=$(mktemp -p "$APP_DIR" .appimg.XXXXXX)
+	cp -- "$src" "$PARTIAL"
+	chmod 755 -- "$PARTIAL"
+	IMG=$PARTIAL
+
+	WORK=$(mktemp -d)
+	ROOT=$WORK/squashfs-root
+	desk=""
+	id=""
+	# Type 1 runtimes don't reliably support --appimage-extract, and an
+	# unknown flag would launch the app instead.
+	if [[ $type == 2 ]]; then
+		extract '*.desktop'
+		for f in "$ROOT"/*.desktop; do
+			[[ -e $f || -L $f ]] || continue
+			id=$(basename -- "$f" .desktop)
+			f=$(resolve "${f#"$ROOT"/}") && [[ -n $f ]] && desk=$ROOT/$f && break
+		done
+	fi
+
+	if [[ -n $desk ]]; then
+		name=$(desktop_key "$desk" Name)
+		icon_rel=$(find_icon "$(desktop_key "$desk" Icon)") || icon_rel=""
+	else
+		warn "no launcher found inside the AppImage; creating a basic one"
+		name=$(name_from_file "$src")
+		id=$(tr '[:upper:] ' '[:lower:]-' <<<"$name")
+		desk=$WORK/generated.desktop
+		printf '[Desktop Entry]\nType=Application\nName=%s\nExec=app\nTerminal=false\nCategories=Utility;\n' "$name" >"$desk"
+		icon_rel=""
+		if [[ $type == 2 ]]; then icon_rel=$(find_icon "") || icon_rel=""; fi
+	fi
+	name=${name:-$id}
+
+	# Keep the AppImage's own desktop file name: GNOME and KDE match windows
+	# to launchers by it. Fall back to a prefixed name if a launcher we didn't
+	# create already uses it.
+	entry=$DESKTOP_DIR/$id.desktop
+	if [[ -e $entry ]] && ! is_ours "$entry"; then
+		id=appimg-$id
+		entry=$DESKTOP_DIR/$id.desktop
+	fi
+	dest=$APP_DIR/$id.AppImage
+	if [[ -e $dest ]]; then verb=Updated; fi
+
+	if [[ -n $icon_rel ]]; then
+		rm -f -- "$ICON_DIR/$id".*
+		icon=$ICON_DIR/$id.$(icon_ext "$ROOT/$icon_rel")
+		cp -- "$ROOT/$icon_rel" "$icon"
+	fi
+
+	mv -f -- "$PARTIAL" "$dest"
+	PARTIAL=""
+	rewrite_desktop "$desk" "$dest" "$icon" >"$entry.tmp"
+	mv -f -- "$entry.tmp" "$entry"
+
+	# Command-line shortcut: org.example.App -> app
+	bin=${id#appimg-}
+	bin=${bin,,}
+	if [[ $bin == *.*.* ]]; then bin=${bin##*.}; fi
+	mkdir -p -- "$BIN_DIR"
+	if [[ ! -e $BIN_DIR/$bin && ! -L $BIN_DIR/$bin ]] || [[ -L $BIN_DIR/$bin && $(readlink -- "$BIN_DIR/$bin") == "$APP_DIR"/* ]]; then
+		ln -sfn -- "$dest" "$BIN_DIR/$bin"
+	else
+		bin=""
+	fi
+
+	if [[ $move == 1 && $src != "$dest" ]]; then rm -f -- "$src"; fi
+	rm -rf -- "$WORK"
+	WORK=""
+	refresh_menu
+
+	printf '%s %s -> %s\n' "$verb" "$name" "$dest"
+	if [[ -n $bin ]]; then
+		printf '  run from a terminal with: %s\n' "$bin"
+		case ":$PATH:" in *":$BIN_DIR:"*) ;; *) warn "$BIN_DIR is not in your PATH" ;; esac
+	fi
+	if needs_libfuse2 "$dest" && ! have_libfuse2; then
+		warn "this AppImage needs FUSE 2, which isn't installed. Fix: $(fuse_hint)"
+		if [[ $NOTIFY == 1 ]]; then notify "$name needs FUSE 2" "Install it with: $(fuse_hint)" critical; fi
+	fi
+	if [[ $NOTIFY == 1 ]]; then notify "$verb $name" "It's now in your application menu."; fi
+}
+
+refresh_menu() {
+	if command -v update-desktop-database >/dev/null; then
+		update-desktop-database -q "$DESKTOP_DIR" 2>/dev/null || true
+	fi
+}
+
+cmd_install() {
+	local move=0 files=() a
+	for a; do
+		case $a in
+		-m | --move) move=1 ;;
+		-n | --notify) NOTIFY=1 ;;
+		-h | --help) usage; exit 0 ;;
+		-*) die "unknown option: $a" ;;
+		*) files+=("$a") ;;
+		esac
+	done
+	((${#files[@]})) || die "no AppImage given (see: appimg --help)"
+	for a in "${files[@]}"; do install_one "$a" "$move"; done
+}
+
+entries() { # print our desktop entries
+	local f
+	for f in "$DESKTOP_DIR"/*.desktop; do
+		if is_ours "$f"; then printf '%s\n' "$f"; fi
+	done
+}
+
+cmd_list() {
+	local f img state found=0
+	while IFS= read -r f; do
+		found=1
+		img=$(desktop_key "$f" "$MARK")
+		state=""
+		[[ -e $img ]] || state="  (AppImage missing)"
+		printf '%-28s %s%s\n' "$(basename -- "$f" .desktop)" "$(desktop_key "$f" Name)" "$state"
+	done < <(entries)
+	if [[ $found == 0 ]]; then echo "No AppImages installed."; fi
+}
+
+cmd_remove() {
+	local want f id img l hit name
+	(($#)) || die "which one? (see: appimg list)"
+	for want; do
+		hit=""
+		while IFS= read -r f; do
+			id=$(basename -- "$f" .desktop)
+			if [[ $id == "$want" || $id == "appimg-$want" || ${id,,} == "${want,,}" ||
+				"$(desktop_key "$f" Name | tr '[:upper:]' '[:lower:]')" == "${want,,}" ]]; then
+				hit=$f
+				break
+			fi
+		done < <(entries)
+		[[ -n $hit ]] || die "'$want' isn't installed (see: appimg list)"
+
+		id=$(basename -- "$hit" .desktop)
+		img=$(desktop_key "$hit" "$MARK")
+		name=$(desktop_key "$hit" Name)
+		for l in "$BIN_DIR"/*; do
+			if [[ -L $l && $(readlink -- "$l") == "$img" ]]; then rm -f -- "$l"; fi
+		done
+		if [[ $img == "$APP_DIR"/* ]]; then rm -f -- "$img"; fi
+		rm -f -- "$ICON_DIR/$id".* "$hit"
+		printf 'Removed %s\n' "${name:-$id}"
+	done
+	refresh_menu
+}
+
+# --- file manager context menus -----------------------------------------------
+
+readonly MENU_LABEL="Install AppImage"
+readonly MENU_ICON=system-software-install
+readonly THUNAR_UCA=$CONFIG_HOME/Thunar/uca.xml
+readonly THUNAR_ID=appimg-install
+
+# Dolphin 24.02+ is built on KF6, which moved service menus to kio/servicemenus.
+dolphin_menu_dir() {
+	local v
+	v=$(dolphin --version 2>/dev/null | awk '{ split($2, a, "."); print a[1] }')
+	if [[ $v =~ ^[0-9]+$ ]] && ((v < 24)); then
+		echo "$DATA_HOME/kservices5/ServiceMenus"
+	else
+		echo "$DATA_HOME/kio/servicemenus"
+	fi
+}
+
+menu_files() { # every file a context menu entry may live in
+	printf '%s\n' \
+		"$DATA_HOME/kio/servicemenus/appimg-install.desktop" \
+		"$DATA_HOME/kservices5/ServiceMenus/appimg-install.desktop" \
+		"$DATA_HOME/nautilus/scripts/$MENU_LABEL" \
+		"$CONFIG_HOME/caja/scripts/$MENU_LABEL" \
+		"$DATA_HOME/nemo/actions/appimg-install.nemo_action"
+}
+
+thunar_remove() {
+	[[ -f $THUNAR_UCA ]] && grep -q "<unique-id>$THUNAR_ID</unique-id>" "$THUNAR_UCA" || return 0
+	awk -v id="<unique-id>$THUNAR_ID</unique-id>" '
+		/<action>/ { buf = $0 "\n"; inside = 1; next }
+		inside { buf = buf $0 "\n"; if (/<\/action>/) { inside = 0; if (index(buf, id) == 0) printf "%s", buf } ; next }
+		{ print }
+	' "$THUNAR_UCA" >"$THUNAR_UCA.tmp"
+	mv -f -- "$THUNAR_UCA.tmp" "$THUNAR_UCA"
+}
+
+thunar_add() { # EXE
+	thunar_remove
+	mkdir -p -- "${THUNAR_UCA%/*}"
+	if [[ ! -f $THUNAR_UCA ]]; then
+		# Thunar only shows its default actions while the user has no uca.xml,
+		# so start from those rather than an empty list.
+		if [[ -f /etc/xdg/Thunar/uca.xml ]]; then
+			cp -- /etc/xdg/Thunar/uca.xml "$THUNAR_UCA"
+		else
+			printf '<?xml version="1.0" encoding="UTF-8"?>\n<actions>\n</actions>\n' >"$THUNAR_UCA"
+		fi
+	fi
+	awk -v exe="$1" -v id="$THUNAR_ID" -v label="$MENU_LABEL" -v icon="$MENU_ICON" '
+		/<\/actions>/ && !done {
+			print "<action>"
+			print "\t<icon>" icon "</icon>"
+			print "\t<name>" label "</name>"
+			print "\t<submenu></submenu>"
+			print "\t<unique-id>" id "</unique-id>"
+			print "\t<command>&quot;" exe "&quot; install --notify %F</command>"
+			print "\t<description>Add to the application menu</description>"
+			print "\t<range>*</range>"
+			print "\t<patterns>*.AppImage;*.appimage</patterns>"
+			print "\t<other-files/>"
+			print "</action>"
+			done = 1
+		}
+		{ print }
+	' "$THUNAR_UCA" >"$THUNAR_UCA.tmp"
+	mv -f -- "$THUNAR_UCA.tmp" "$THUNAR_UCA"
+}
+
+# Writes a context menu entry for each installed file manager. Prints the
+# names of the ones it set up.
+menus_add() { # EXE
+	local exe=$1 dir mimes
+	mimes=$(printf '%s;' "${MIME_TYPES[@]}")
+
+	if command -v dolphin >/dev/null; then
+		dir=$(dolphin_menu_dir)
+		mkdir -p -- "$dir"
+		cat >"$dir/appimg-install.desktop" <<EOF
+[Desktop Entry]
+Type=Service
+MimeType=$mimes
+Actions=install
+X-KDE-Priority=TopLevel
+
+[Desktop Action install]
+Name=$MENU_LABEL
+Icon=$MENU_ICON
+Exec="$exe" install --notify %F
+EOF
+		# KF6 ignores service menus outside system dirs unless executable.
+		chmod 755 -- "$dir/appimg-install.desktop"
+		echo Dolphin
+	fi
+
+	# Nautilus and Caja run scripts in the current folder with the selected
+	# files as arguments. They can't filter by type, so this shows for every
+	# file under the Scripts submenu; appimg rejects non-AppImages.
+	if command -v nautilus >/dev/null; then
+		mkdir -p -- "$DATA_HOME/nautilus/scripts"
+		printf '#!/bin/sh\nexec "%s" install --notify "$@"\n' "$exe" >"$DATA_HOME/nautilus/scripts/$MENU_LABEL"
+		chmod 755 -- "$DATA_HOME/nautilus/scripts/$MENU_LABEL"
+		echo "GNOME Files (under Scripts)"
+	fi
+	if command -v caja >/dev/null; then
+		mkdir -p -- "$CONFIG_HOME/caja/scripts"
+		printf '#!/bin/sh\nexec "%s" install --notify "$@"\n' "$exe" >"$CONFIG_HOME/caja/scripts/$MENU_LABEL"
+		chmod 755 -- "$CONFIG_HOME/caja/scripts/$MENU_LABEL"
+		echo "Caja (under Scripts)"
+	fi
+
+	if command -v nemo >/dev/null; then
+		mkdir -p -- "$DATA_HOME/nemo/actions"
+		cat >"$DATA_HOME/nemo/actions/appimg-install.nemo_action" <<EOF
+[Nemo Action]
+Name=$MENU_LABEL
+Comment=Add to the application menu
+Exec="$exe" install --notify %F
+Icon-Name=$MENU_ICON
+Selection=notnone
+Mimetypes=$mimes
+EOF
+		echo Nemo
+	fi
+
+	if command -v thunar >/dev/null; then
+		case $exe in *[\&\<\>]*) warn "skipping Thunar: $exe contains & < or >" ;; *)
+			thunar_add "$exe"
+			echo "Thunar (restart it with 'thunar -q' to see the entry)"
+			;;
+		esac
+	fi
+}
+
+menus_remove() {
+	local f
+	while IFS= read -r f; do rm -f -- "$f"; done < <(menu_files)
+	thunar_remove
+}
+
+cmd_setup() {
+	local self target=$BIN_DIR/appimg launcher=$DESKTOP_DIR/appimg.desktop mimeapps=$CONFIG_HOME/mimeapps.list t fm
+	if [[ ${1:-} == --remove ]]; then
+		menus_remove
+		rm -f -- "$launcher"
+		if [[ -f $mimeapps ]]; then
+			for t in "${MIME_TYPES[@]}"; do sed -i "\|^$t=appimg\.desktop;\?$|d" "$mimeapps"; done
+		fi
+		refresh_menu
+		rm -f -- "$target"
+		echo "Removed appimg's file manager integration and $target."
+		echo "Installed AppImages were left alone; remove them with 'appimg remove' first if you want."
+		return
+	fi
+
+	self=$(realpath -- "${BASH_SOURCE[0]}")
+	mkdir -p -- "$BIN_DIR" "$DESKTOP_DIR"
+	if [[ $self != "$(realpath -m -- "$target")" ]]; then install -m 755 -- "$self" "$target"; fi
+	cat >"$launcher" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Install AppImage
+Comment=Add an AppImage to the application menu
+Exec="$target" install --notify %F
+Icon=system-software-install
+MimeType=$(printf '%s;' "${MIME_TYPES[@]}")
+NoDisplay=true
+Terminal=false
+EOF
+	refresh_menu
+	if command -v xdg-mime >/dev/null; then
+		xdg-mime default appimg.desktop "${MIME_TYPES[@]}"
+	else
+		warn "xdg-mime not found; pick 'Install AppImage' via 'Open with' in your file manager"
+	fi
+	echo "Installed $target."
+	echo "Double-clicking an .AppImage file now installs it."
+	while IFS= read -r fm; do
+		echo "Added '$MENU_LABEL' to the right-click menu in $fm."
+	done < <(menus_add "$target")
+	case ":$PATH:" in *":$BIN_DIR:"*) ;; *) warn "$BIN_DIR is not in your PATH" ;; esac
+}
+
+main() {
+	local cmd=${1:-}
+	case $cmd in
+	install | add | i) shift; cmd_install "$@" ;;
+	list | ls) cmd_list ;;
+	remove | rm | uninstall) shift; cmd_remove "$@" ;;
+	setup) shift; cmd_setup "$@" ;;
+	-h | --help | help | "") usage ;;
+	-V | --version) echo "appimg $VERSION" ;;
+	*) cmd_install "$@" ;;
+	esac
+}
+
+main "$@"
